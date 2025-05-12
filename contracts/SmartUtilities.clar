@@ -349,3 +349,93 @@
         false
     )
 )
+
+
+(define-public (disable-auto-pay)
+    (ok (map-set auto-payments tx-sender
+        {
+            enabled: false,
+            max-amount: u0
+        }))
+)
+
+
+(define-map provider-delegates
+    {provider: principal, delegate: principal}
+    {
+        active: bool,
+        role: (string-ascii 20),
+        delegation-time: uint
+    }
+)
+
+(define-public (add-provider-delegate (delegate principal) (role (string-ascii 20)))
+    (let (
+        (provider (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+    )
+        (asserts! (get active provider) err-unauthorized)
+        (ok (map-set provider-delegates 
+            {provider: tx-sender, delegate: delegate}
+            {
+                active: true,
+                role: role,
+                delegation-time: stacks-block-height
+            }))
+    )
+)
+
+(define-public (remove-provider-delegate (delegate principal))
+    (let (
+        (provider (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+        (delegation (unwrap! (map-get? provider-delegates {provider: tx-sender, delegate: delegate}) err-not-found))
+    )
+        (ok (map-set provider-delegates 
+            {provider: tx-sender, delegate: delegate}
+            (merge delegation {active: false})))
+    )
+)
+
+(define-read-only (is-authorized-delegate (provider principal) (delegate principal))
+    (match (map-get? provider-delegates {provider: provider, delegate: delegate})
+        delegation (get active delegation)
+        false
+    )
+)
+
+
+(define-map usage-analytics
+    principal
+    {
+        peak-usage: uint,
+        average-usage: uint,
+        total-payments: uint,
+        payment-count: uint,
+        last-analysis: uint
+    }
+)
+
+(define-public (update-usage-analytics (consumer principal) (current-usage uint) (payment-amount uint))
+    (let (
+        (existing-analytics (default-to 
+            {peak-usage: u0, average-usage: u0, total-payments: u0, payment-count: u0, last-analysis: u0}
+            (map-get? usage-analytics consumer)))
+        (new-peak (if (> current-usage (get peak-usage existing-analytics))
+            current-usage
+            (get peak-usage existing-analytics)))
+        (new-payment-count (+ (get payment-count existing-analytics) u1))
+        (new-average (/ (+ current-usage (* (get average-usage existing-analytics) (get payment-count existing-analytics))) new-payment-count))
+    )
+        (ok (map-set usage-analytics consumer
+            {
+                peak-usage: new-peak,
+                average-usage: new-average,
+                total-payments: (+ (get total-payments existing-analytics) payment-amount),
+                payment-count: new-payment-count,
+                last-analysis: stacks-block-height
+            }))
+    )
+)
+
+(define-read-only (get-consumer-analytics (consumer principal))
+    (map-get? usage-analytics consumer)
+)
