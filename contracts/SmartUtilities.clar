@@ -439,3 +439,181 @@
 (define-read-only (get-consumer-analytics (consumer principal))
     (map-get? usage-analytics consumer)
 )
+
+(define-map emergency-credits
+    {consumer: principal, credit-id: uint}
+    {
+        provider: principal,
+        credit-amount: uint,
+        reason: (string-ascii 100),
+        granted-at: uint,
+        repayment-deadline: uint,
+        amount-repaid: uint,
+        status: (string-ascii 20),
+        interest-rate: uint
+    }
+)
+
+(define-map consumer-credit-eligibility
+    principal
+    {
+        max-credit-limit: uint,
+        current-credit-used: uint,
+        credit-score: uint,
+        emergency-credits-taken: uint,
+        last-credit-date: uint
+    }
+)
+
+(define-data-var emergency-credit-counter uint u0)
+
+(define-constant err-credit-limit-exceeded (err u105))
+(define-constant err-not-eligible (err u106))
+(define-constant err-invalid-repayment (err u107))
+
+(define-public (initialize-credit-eligibility (consumer principal) (credit-limit uint))
+    (begin
+        (asserts! (is-some (map-get? utility-providers tx-sender)) err-unauthorized)
+        (ok (map-set consumer-credit-eligibility consumer
+            {
+                max-credit-limit: credit-limit,
+                current-credit-used: u0,
+                credit-score: u100,
+                emergency-credits-taken: u0,
+                last-credit-date: u0
+            }))
+    )
+)
+
+(define-public (request-emergency-credit (provider principal) (amount uint) (reason (string-ascii 100)))
+    (let (
+        (eligibility (unwrap! (map-get? consumer-credit-eligibility tx-sender) err-not-found))
+        (provider-info (unwrap! (map-get? utility-providers provider) err-not-found))
+        (credit-id (+ (var-get emergency-credit-counter) u1))
+        (available-credit (- (get max-credit-limit eligibility) (get current-credit-used eligibility)))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (>= available-credit amount) err-credit-limit-exceeded)
+        (asserts! (>= (get credit-score eligibility) u50) err-not-eligible)
+        (var-set emergency-credit-counter credit-id)
+        (map-set emergency-credits {consumer: tx-sender, credit-id: credit-id}
+            {
+                provider: provider,
+                credit-amount: amount,
+                reason: reason,
+                granted-at: stacks-block-height,
+                repayment-deadline: (+ stacks-block-height u4320),
+                amount-repaid: u0,
+                status: "pending",
+                interest-rate: u5
+            })
+        (ok credit-id)
+    )
+)
+
+(define-public (approve-emergency-credit (consumer principal) (credit-id uint))
+    (let (
+        (credit (unwrap! (map-get? emergency-credits {consumer: consumer, credit-id: credit-id}) err-not-found))
+        (eligibility (unwrap! (map-get? consumer-credit-eligibility consumer) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get provider credit)) err-unauthorized)
+        (asserts! (is-eq (get status credit) "pending") err-invalid-amount)
+        (try! (stx-transfer? (get credit-amount credit) tx-sender consumer))
+        (map-set emergency-credits {consumer: consumer, credit-id: credit-id}
+            (merge credit {status: "active"}))
+        (map-set consumer-credit-eligibility consumer
+            (merge eligibility 
+                {
+                    current-credit-used: (+ (get current-credit-used eligibility) (get credit-amount credit)),
+                    emergency-credits-taken: (+ (get emergency-credits-taken eligibility) u1),
+                    last-credit-date: stacks-block-height
+                }))
+        (ok true)
+    )
+)
+
+(define-public (repay-emergency-credit (credit-id uint) (repayment-amount uint))
+    (let (
+        (credit (unwrap! (map-get? emergency-credits {consumer: tx-sender, credit-id: credit-id}) err-not-found))
+        (eligibility (unwrap! (map-get? consumer-credit-eligibility tx-sender) err-not-found))
+        (interest-amount (/ (* (get credit-amount credit) (get interest-rate credit)) u100))
+        (total-due (+ (get credit-amount credit) interest-amount))
+        (remaining-balance (- total-due (get amount-repaid credit)))
+        (new-amount-repaid (+ (get amount-repaid credit) repayment-amount))
+    )
+        (asserts! (is-eq (get status credit) "active") err-invalid-repayment)
+        (asserts! (<= repayment-amount remaining-balance) err-invalid-amount)
+        (try! (stx-transfer? repayment-amount tx-sender (get provider credit)))
+        (let (
+            (new-status (if (>= new-amount-repaid total-due) "completed" "active"))
+            (credit-reduction (if (>= new-amount-repaid total-due) (get credit-amount credit) u0))
+        )
+            (map-set emergency-credits {consumer: tx-sender, credit-id: credit-id}
+                (merge credit 
+                    {
+                        amount-repaid: new-amount-repaid,
+                        status: new-status
+                    }))
+            (map-set consumer-credit-eligibility tx-sender
+                (merge eligibility 
+                    {
+                        current-credit-used: (- (get current-credit-used eligibility) credit-reduction),
+                        credit-score: (if (is-eq new-status "completed") 
+                            (my-min (+ (get credit-score eligibility) u10) u100)
+                            (get credit-score eligibility))
+                    }))
+            (ok true)
+        )
+    )
+)
+
+(define-public (deny-emergency-credit (consumer principal) (credit-id uint))
+    (let (
+        (credit (unwrap! (map-get? emergency-credits {consumer: consumer, credit-id: credit-id}) err-not-found))
+    )
+        (asserts! (is-eq tx-sender (get provider credit)) err-unauthorized)
+        (asserts! (is-eq (get status credit) "pending") err-invalid-amount)
+        (ok (map-set emergency-credits {consumer: consumer, credit-id: credit-id}
+            (merge credit {status: "denied"})))
+    )
+)
+
+(define-read-only (get-emergency-credit-details (consumer principal) (credit-id uint))
+    (map-get? emergency-credits {consumer: consumer, credit-id: credit-id})
+)
+
+(define-read-only (get-consumer-credit-status (consumer principal))
+    (map-get? consumer-credit-eligibility consumer)
+)
+
+(define-read-only (calculate-credit-interest (consumer principal) (credit-id uint))
+    (match (map-get? emergency-credits {consumer: consumer, credit-id: credit-id})
+        credit (/ (* (get credit-amount credit) (get interest-rate credit)) u100)
+        u0
+    )
+)
+
+(define-read-only (get-total-credit-due (consumer principal) (credit-id uint))
+    (match (map-get? emergency-credits {consumer: consumer, credit-id: credit-id})
+        credit (let (
+            (interest (/ (* (get credit-amount credit) (get interest-rate credit)) u100))
+            (total-due (+ (get credit-amount credit) interest))
+        )
+            (- total-due (get amount-repaid credit)))
+        u0
+    )
+)
+
+(define-read-only (is-credit-overdue (consumer principal) (credit-id uint))
+    (match (map-get? emergency-credits {consumer: consumer, credit-id: credit-id})
+        credit (and 
+            (is-eq (get status credit) "active")
+            (> stacks-block-height (get repayment-deadline credit)))
+        false
+    )
+)
+
+;; Helper function for minimum of two uints
+(define-read-only (my-min (a uint) (b uint))
+    (if (< a b) a b)
+)
