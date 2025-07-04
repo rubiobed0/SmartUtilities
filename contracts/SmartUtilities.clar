@@ -13,6 +13,40 @@
 ;; Data Variables
 (define-data-var service-fee uint u1000) ;; in micro-STX
 
+
+(define-map usage-history
+    {consumer: principal, month: uint, year: uint}
+    {
+        total-units: uint,
+        total-cost: uint,
+        average-daily-usage: uint,
+        days-in-period: uint,
+        recorded-at: uint
+    }
+)
+
+(define-map seasonal-patterns
+    {consumer: principal, season: uint}
+    {
+        average-usage: uint,
+        pattern-strength: uint,
+        last-updated: uint
+    }
+)
+
+(define-map consumption-forecasts
+    {consumer: principal, forecast-month: uint, forecast-year: uint}
+    {
+        predicted-usage: uint,
+        predicted-cost: uint,
+        confidence-level: uint,
+        generated-at: uint
+    }
+)
+
+(define-constant err-insufficient-data (err u108))
+(define-constant err-invalid-period (err u109))
+
 ;; Data Maps
 (define-map utility-providers 
     principal 
@@ -616,4 +650,147 @@
 ;; Helper function for minimum of two uints
 (define-read-only (my-min (a uint) (b uint))
     (if (< a b) a b)
+)
+
+
+(define-public (record-monthly-usage (consumer principal) (month uint) (year uint) (total-units uint) (total-cost uint) (days-in-period uint))
+    (let (
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+        (average-daily (/ total-units days-in-period))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (and (>= month u1) (<= month u12)) err-invalid-period)
+        (asserts! (> year u0) err-invalid-period)
+        (asserts! (> days-in-period u0) err-invalid-period)
+        (ok (map-set usage-history {consumer: consumer, month: month, year: year}
+            {
+                total-units: total-units,
+                total-cost: total-cost,
+                average-daily-usage: average-daily,
+                days-in-period: days-in-period,
+                recorded-at: stacks-block-height
+            }))
+    )
+)
+
+(define-public (update-seasonal-pattern (consumer principal) (season uint) (average-usage uint) (pattern-strength uint))
+    (begin
+        (asserts! (and (>= season u1) (<= season u4)) err-invalid-period)
+        (asserts! (<= pattern-strength u100) err-invalid-amount)
+        (ok (map-set seasonal-patterns {consumer: consumer, season: season}
+            {
+                average-usage: average-usage,
+                pattern-strength: pattern-strength,
+                last-updated: stacks-block-height
+            }))
+    )
+)
+
+(define-public (generate-consumption-forecast (consumer principal) (forecast-month uint) (forecast-year uint))
+    (let (
+        (current-season (get-season-from-month forecast-month))
+        (seasonal-data (map-get? seasonal-patterns {consumer: consumer, season: current-season}))
+        (historical-usage (get-historical-average consumer forecast-month))
+        (base-prediction (match seasonal-data
+            pattern (weighted-average historical-usage (get average-usage pattern) (get pattern-strength pattern))
+            historical-usage))
+        (current-rate (get-current-rate-for-consumer consumer))
+        (predicted-cost (* base-prediction current-rate))
+        (confidence (calculate-confidence consumer forecast-month))
+    )
+        (asserts! (and (>= forecast-month u1) (<= forecast-month u12)) err-invalid-period)
+        (asserts! (> forecast-year u0) err-invalid-period)
+        (asserts! (> base-prediction u0) err-insufficient-data)
+        (ok (map-set consumption-forecasts {consumer: consumer, forecast-month: forecast-month, forecast-year: forecast-year}
+            {
+                predicted-usage: base-prediction,
+                predicted-cost: predicted-cost,
+                confidence-level: confidence,
+                generated-at: stacks-block-height
+            }))
+    )
+)
+
+(define-read-only (get-consumption-forecast (consumer principal) (forecast-month uint) (forecast-year uint))
+    (map-get? consumption-forecasts {consumer: consumer, forecast-month: forecast-month, forecast-year: forecast-year})
+)
+
+(define-read-only (get-usage-history (consumer principal) (month uint) (year uint))
+    (map-get? usage-history {consumer: consumer, month: month, year: year})
+)
+
+(define-read-only (get-seasonal-pattern (consumer principal) (season uint))
+    (map-get? seasonal-patterns {consumer: consumer, season: season})
+)
+
+(define-read-only (get-season-from-month (month uint))
+    (if (<= month u3) u1
+        (if (<= month u6) u2
+            (if (<= month u9) u3 u4)))
+)
+
+(define-read-only (get-historical-average (consumer principal) (month uint))
+    (let (
+        (last-year-data (map-get? usage-history {consumer: consumer, month: month, year: u2023}))
+        (two-years-ago-data (map-get? usage-history {consumer: consumer, month: month, year: u2022}))
+    )
+        (match last-year-data
+            recent-data (get total-units recent-data)
+            (match two-years-ago-data
+                older-data (get total-units older-data)
+                u0))
+    )
+)
+
+(define-read-only (get-current-rate-for-consumer (consumer principal))
+    (let (
+        (latest-usage (map-get? usage-records {consumer: consumer, period: u1}))
+    )
+        (match latest-usage
+            usage-data (match (map-get? utility-providers (get provider usage-data))
+                provider-data (get rate-per-unit provider-data)
+                u0)
+            u0)
+    )
+)
+
+(define-read-only (weighted-average (value1 uint) (value2 uint) (weight uint))
+    (/ (+ (* value1 (- u100 weight)) (* value2 weight)) u100)
+)
+
+(define-read-only (calculate-confidence (consumer principal) (month uint))
+    (let (
+        (historical-data-points (count-historical-data-points consumer month))
+        (seasonal-data-available (is-some (map-get? seasonal-patterns {consumer: consumer, season: (get-season-from-month month)})))
+    )
+        (if (and (> historical-data-points u1) seasonal-data-available)
+            (my-min (+ (* historical-data-points u20) u20) u100)
+            (my-min (* historical-data-points u25) u60))
+    )
+)
+
+(define-read-only (count-historical-data-points (consumer principal) (month uint))
+    (let (
+        (data-2023 (is-some (map-get? usage-history {consumer: consumer, month: month, year: u2023})))
+        (data-2022 (is-some (map-get? usage-history {consumer: consumer, month: month, year: u2022})))
+        (data-2021 (is-some (map-get? usage-history {consumer: consumer, month: month, year: u2021})))
+    )
+        (+ 
+            (if data-2023 u1 u0)
+            (if data-2022 u1 u0)
+            (if data-2021 u1 u0))
+    )
+)
+
+(define-read-only (get-forecast-accuracy (consumer principal) (actual-usage uint) (forecast-month uint) (forecast-year uint))
+    (match (map-get? consumption-forecasts {consumer: consumer, forecast-month: forecast-month, forecast-year: forecast-year})
+        forecast (let (
+            (predicted-usage (get predicted-usage forecast))
+            (difference (if (> actual-usage predicted-usage) 
+                (- actual-usage predicted-usage) 
+                (- predicted-usage actual-usage)))
+            (accuracy-percentage (- u100 (/ (* difference u100) predicted-usage)))
+        )
+            accuracy-percentage)
+        u0)
 )
