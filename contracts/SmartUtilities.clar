@@ -652,6 +652,295 @@
     (if (< a b) a b)
 )
 
+;; Dynamic Pricing Engine
+;; Real-time utility rate adjustments based on demand, time, and grid conditions
+
+;; Dynamic pricing constants
+(define-constant err-invalid-tier (err u110))
+(define-constant err-pricing-inactive (err u111))
+(define-constant err-demand-overflow (err u112))
+
+;; Time-based pricing tiers for providers
+(define-map pricing-tiers
+    {provider: principal, tier-level: uint}
+    {
+        rate-multiplier: uint,          ;; Percentage multiplier (100 = 1x, 150 = 1.5x base rate)
+        demand-threshold: uint,         ;; Usage threshold to trigger this tier
+        time-start: uint,              ;; Hour of day when tier becomes active (0-23)
+        time-end: uint,                ;; Hour of day when tier ends (0-23)
+        active: bool,                  ;; Whether this tier is currently enabled
+        tier-name: (string-ascii 30)   ;; Description of the tier
+    }
+)
+
+;; Current demand tracking for each provider
+(define-map current-demand
+    principal
+    {
+        total-active-consumers: uint,
+        current-usage-rate: uint,       ;; Units consumed per hour across all consumers
+        demand-level: uint,             ;; Current demand level (1-5, where 5 is highest)
+        last-updated: uint,
+        peak-demand-today: uint
+    }
+)
+
+;; Dynamic rate history for transparency
+(define-map rate-changes
+    {provider: principal, change-id: uint}
+    {
+        old-rate: uint,
+        new-rate: uint,
+        reason: (string-ascii 50),      ;; "peak-hours", "high-demand", "emergency", etc.
+        effective-time: uint,
+        duration-hours: uint
+    }
+)
+
+;; Consumer rate notifications
+(define-map rate-notifications
+    {consumer: principal, notification-id: uint}
+    {
+        provider: principal,
+        new-rate: uint,
+        rate-change-percent: uint,
+        notification-type: (string-ascii 30),
+        created-at: uint,
+        acknowledged: bool
+    }
+)
+
+;; Surge pricing triggers
+(define-map surge-conditions
+    principal
+    {
+        surge-active: bool,
+        surge-multiplier: uint,         ;; Additional multiplier during surge
+        trigger-threshold: uint,        ;; Demand level that triggers surge
+        max-surge-rate: uint,          ;; Maximum rate during surge
+        surge-started: uint,
+        estimated-duration: uint
+    }
+)
+
+;; Data variables for pricing system
+(define-data-var rate-change-counter uint u0)
+(define-data-var notification-counter uint u0)
+
+;; Setup pricing tiers for a provider
+(define-public (setup-pricing-tier (tier-level uint) (rate-multiplier uint) (demand-threshold uint) 
+                                  (time-start uint) (time-end uint) (tier-name (string-ascii 30)))
+    (let (
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (and (>= tier-level u1) (<= tier-level u5)) err-invalid-tier)
+        (asserts! (and (>= rate-multiplier u50) (<= rate-multiplier u500)) err-invalid-amount)
+        (asserts! (and (>= time-start u0) (<= time-start u23)) err-invalid-period)
+        (asserts! (and (>= time-end u0) (<= time-end u23)) err-invalid-period)
+        (ok (map-set pricing-tiers {provider: tx-sender, tier-level: tier-level}
+            {
+                rate-multiplier: rate-multiplier,
+                demand-threshold: demand-threshold,
+                time-start: time-start,
+                time-end: time-end,
+                active: true,
+                tier-name: tier-name
+            }))
+    )
+)
+
+;; Update current demand levels for dynamic pricing
+(define-public (update-demand-metrics (total-consumers uint) (current-usage-rate uint))
+    (let (
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+        (existing-demand (default-to 
+            {total-active-consumers: u0, current-usage-rate: u0, demand-level: u1, last-updated: u0, peak-demand-today: u0}
+            (map-get? current-demand tx-sender)))
+        (new-demand-level (calculate-demand-level current-usage-rate total-consumers))
+        (new-peak (my-max (get peak-demand-today existing-demand) current-usage-rate))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (<= total-consumers u10000) err-demand-overflow)
+        (ok (map-set current-demand tx-sender
+            {
+                total-active-consumers: total-consumers,
+                current-usage-rate: current-usage-rate,
+                demand-level: new-demand-level,
+                last-updated: stacks-block-height,
+                peak-demand-today: new-peak
+            }))
+    )
+)
+
+;; Calculate current dynamic rate for a provider
+(define-public (get-current-dynamic-rate (provider principal) (current-hour uint))
+    (let (
+        (base-provider (unwrap! (map-get? utility-providers provider) err-not-found))
+        (demand-info (default-to 
+            {total-active-consumers: u0, current-usage-rate: u0, demand-level: u1, last-updated: u0, peak-demand-today: u0}
+            (map-get? current-demand provider)))
+        (base-rate (get rate-per-unit base-provider))
+        (active-tier (find-active-pricing-tier provider (get demand-level demand-info) current-hour))
+        (surge-info (map-get? surge-conditions provider))
+    )
+        (asserts! (get active base-provider) err-unauthorized)
+        (let (
+            (tier-adjusted-rate (match active-tier
+                tier (* base-rate (/ (get rate-multiplier tier) u100))
+                base-rate))
+            (final-rate (match surge-info
+                surge (if (get surge-active surge)
+                    (my-min (* tier-adjusted-rate (/ (get surge-multiplier surge) u100)) (get max-surge-rate surge))
+                    tier-adjusted-rate)
+                tier-adjusted-rate))
+        )
+            (ok final-rate)
+        )
+    )
+)
+
+;; Activate surge pricing during high demand
+(define-public (activate-surge-pricing (surge-multiplier uint) (estimated-duration uint))
+    (let (
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+        (demand-info (unwrap! (map-get? current-demand tx-sender) err-not-found))
+        (base-rate (get rate-per-unit provider-info))
+        (max-surge (my-min (* base-rate u3) (* base-rate (/ surge-multiplier u100))))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (>= (get demand-level demand-info) u4) err-invalid-amount)
+        (asserts! (and (>= surge-multiplier u120) (<= surge-multiplier u300)) err-invalid-amount)
+        (ok (map-set surge-conditions tx-sender
+            {
+                surge-active: true,
+                surge-multiplier: surge-multiplier,
+                trigger-threshold: u4,
+                max-surge-rate: max-surge,
+                surge-started: stacks-block-height,
+                estimated-duration: estimated-duration
+            }))
+    )
+)
+
+;; Deactivate surge pricing
+(define-public (deactivate-surge-pricing)
+    (let (
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+        (existing-surge (unwrap! (map-get? surge-conditions tx-sender) err-not-found))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (ok (map-set surge-conditions tx-sender
+            (merge existing-surge {surge-active: false})))
+    )
+)
+
+;; Send rate change notification to consumer
+(define-public (notify-rate-change (consumer principal) (new-rate uint) (change-percent uint) (notification-type (string-ascii 30)))
+    (let (
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+        (notification-id (+ (var-get notification-counter) u1))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (var-set notification-counter notification-id)
+        (ok (map-set rate-notifications {consumer: consumer, notification-id: notification-id}
+            {
+                provider: tx-sender,
+                new-rate: new-rate,
+                rate-change-percent: change-percent,
+                notification-type: notification-type,
+                created-at: stacks-block-height,
+                acknowledged: false
+            }))
+    )
+)
+
+;; Consumer acknowledges rate change notification
+(define-public (acknowledge-rate-notification (notification-id uint))
+    (let (
+        (notification (unwrap! (map-get? rate-notifications {consumer: tx-sender, notification-id: notification-id}) err-not-found))
+    )
+        (ok (map-set rate-notifications {consumer: tx-sender, notification-id: notification-id}
+            (merge notification {acknowledged: true})))
+    )
+)
+
+;; Read-only functions for dynamic pricing
+
+;; Get pricing tier details
+(define-read-only (get-pricing-tier (provider principal) (tier-level uint))
+    (map-get? pricing-tiers {provider: provider, tier-level: tier-level})
+)
+
+;; Get current demand information
+(define-read-only (get-demand-status (provider principal))
+    (map-get? current-demand provider)
+)
+
+;; Get surge pricing status
+(define-read-only (get-surge-status (provider principal))
+    (map-get? surge-conditions provider)
+)
+
+;; Get consumer notifications
+(define-read-only (get-rate-notification (consumer principal) (notification-id uint))
+    (map-get? rate-notifications {consumer: consumer, notification-id: notification-id})
+)
+
+;; Check if provider has dynamic pricing enabled
+(define-read-only (has-dynamic-pricing (provider principal))
+    (is-some (map-get? pricing-tiers {provider: provider, tier-level: u1}))
+)
+
+;; Private helper functions for dynamic pricing
+
+;; Calculate demand level based on usage and consumer count
+(define-read-only (calculate-demand-level (usage-rate uint) (consumer-count uint))
+    (let (
+        (usage-per-consumer (if (> consumer-count u0) (/ usage-rate consumer-count) u0))
+    )
+        (if (> usage-per-consumer u100) u5
+            (if (> usage-per-consumer u75) u4
+                (if (> usage-per-consumer u50) u3
+                    (if (> usage-per-consumer u25) u2 u1))))
+    )
+)
+
+;; Find active pricing tier based on demand and time
+(define-read-only (find-active-pricing-tier (provider principal) (demand-level uint) (current-hour uint))
+    (let (
+        (tier1 (map-get? pricing-tiers {provider: provider, tier-level: u1}))
+        (tier2 (map-get? pricing-tiers {provider: provider, tier-level: u2}))
+        (tier3 (map-get? pricing-tiers {provider: provider, tier-level: u3}))
+        (tier4 (map-get? pricing-tiers {provider: provider, tier-level: u4}))
+        (tier5 (map-get? pricing-tiers {provider: provider, tier-level: u5}))
+    )
+        (if (and (>= demand-level u5) (is-tier-active-now tier5 current-hour)) tier5
+            (if (and (>= demand-level u4) (is-tier-active-now tier4 current-hour)) tier4
+                (if (and (>= demand-level u3) (is-tier-active-now tier3 current-hour)) tier3
+                    (if (and (>= demand-level u2) (is-tier-active-now tier2 current-hour)) tier2
+                        (if (is-tier-active-now tier1 current-hour) tier1 none)))))
+    )
+)
+
+;; Check if a pricing tier is active at current time
+(define-read-only (is-tier-active-now (tier (optional {rate-multiplier: uint, demand-threshold: uint, time-start: uint, time-end: uint, active: bool, tier-name: (string-ascii 30)})) (current-hour uint))
+    (match tier
+        tier-data (and 
+            (get active tier-data)
+            (or 
+                (and (<= (get time-start tier-data) (get time-end tier-data))
+                     (and (>= current-hour (get time-start tier-data)) (<= current-hour (get time-end tier-data))))
+                (and (> (get time-start tier-data) (get time-end tier-data))
+                     (or (>= current-hour (get time-start tier-data)) (<= current-hour (get time-end tier-data))))))
+        false)
+)
+
+;; Helper function for maximum of two uints
+(define-read-only (my-max (a uint) (b uint))
+    (if (> a b) a b)
+)
+
 
 (define-public (record-monthly-usage (consumer principal) (month uint) (year uint) (total-units uint) (total-cost uint) (days-in-period uint))
     (let (
