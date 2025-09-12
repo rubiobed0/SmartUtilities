@@ -1083,3 +1083,288 @@
             accuracy-percentage)
         u0)
 )
+
+;; ==========================================
+;; OUTAGE REPORTING & COMPENSATION SYSTEM
+;; ==========================================
+
+;; Additional error constants for outage system
+(define-constant err-outage-not-found (err u113))
+(define-constant err-outage-already-resolved (err u114))
+(define-constant err-invalid-sla (err u115))
+(define-constant err-compensation-already-paid (err u116))
+
+;; Service outage reports
+(define-map outage-reports
+    {consumer: principal, outage-id: uint}
+    {
+        provider: principal,
+        reported-at: uint,
+        acknowledged-at: uint,
+        resolved-at: uint,
+        outage-type: (string-ascii 30),    ;; "power", "water", "gas", "internet"
+        severity: uint,                     ;; 1-5 scale (5 = critical)
+        status: (string-ascii 20),         ;; "reported", "acknowledged", "resolved"
+        description: (string-ascii 200),
+        compensation-calculated: bool,
+        compensation-amount: uint
+    }
+)
+
+;; Provider Service Level Agreements
+(define-map provider-slas
+    principal
+    {
+        max-outage-duration: uint,         ;; Maximum acceptable outage duration in blocks
+        compensation-rate: uint,           ;; Compensation per block of outage (in microSTX)
+        response-time-guarantee: uint,     ;; Guaranteed response time in blocks
+        uptime-percentage: uint,           ;; Target uptime percentage (95, 99, etc.)
+        penalty-multiplier: uint           ;; Multiplier for compensation if SLA breached
+    }
+)
+
+;; Outage statistics per provider
+(define-map outage-statistics
+    principal
+    {
+        total-outages: uint,
+        total-downtime: uint,              ;; Total downtime in blocks
+        average-resolution-time: uint,
+        sla-violations: uint,
+        total-compensation-paid: uint,
+        last-outage-date: uint
+    }
+)
+
+;; Consumer compensation records
+(define-map compensation-records
+    {consumer: principal, outage-id: uint}
+    {
+        base-compensation: uint,
+        sla-penalty: uint,
+        total-compensation: uint,
+        paid-at: uint,
+        payment-status: (string-ascii 20)  ;; "pending", "paid", "disputed"
+    }
+)
+
+;; Counters for outage tracking
+(define-data-var outage-counter uint u0)
+
+;; Set provider SLA terms
+(define-public (set-provider-sla (max-duration uint) (compensation-rate uint) (response-time uint) (uptime-target uint) (penalty-multiplier uint))
+    (let (
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (and (> max-duration u0) (<= max-duration u1440)) err-invalid-sla)  ;; Max 1440 blocks (~1 day)
+        (asserts! (and (>= uptime-target u90) (<= uptime-target u100)) err-invalid-sla)
+        (asserts! (and (>= penalty-multiplier u100) (<= penalty-multiplier u500)) err-invalid-sla)
+        (ok (map-set provider-slas tx-sender
+            {
+                max-outage-duration: max-duration,
+                compensation-rate: compensation-rate,
+                response-time-guarantee: response-time,
+                uptime-percentage: uptime-target,
+                penalty-multiplier: penalty-multiplier
+            }))
+    )
+)
+
+;; Report service outage
+(define-public (report-outage (provider principal) (outage-type (string-ascii 30)) (severity uint) (description (string-ascii 200)))
+    (let (
+        (consumer-account (unwrap! (map-get? consumer-accounts tx-sender) err-not-found))
+        (provider-info (unwrap! (map-get? utility-providers provider) err-not-found))
+        (outage-id (+ (var-get outage-counter) u1))
+    )
+        (asserts! (get active consumer-account) err-unauthorized)
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (and (>= severity u1) (<= severity u5)) err-invalid-amount)
+        (var-set outage-counter outage-id)
+        (ok (map-set outage-reports {consumer: tx-sender, outage-id: outage-id}
+            {
+                provider: provider,
+                reported-at: stacks-block-height,
+                acknowledged-at: u0,
+                resolved-at: u0,
+                outage-type: outage-type,
+                severity: severity,
+                status: "reported",
+                description: description,
+                compensation-calculated: false,
+                compensation-amount: u0
+            }))
+    )
+)
+
+;; Provider acknowledges outage report
+(define-public (acknowledge-outage (consumer principal) (outage-id uint))
+    (let (
+        (outage (unwrap! (map-get? outage-reports {consumer: consumer, outage-id: outage-id}) err-outage-not-found))
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (is-eq tx-sender (get provider outage)) err-unauthorized)
+        (asserts! (is-eq (get status outage) "reported") err-invalid-amount)
+        (ok (map-set outage-reports {consumer: consumer, outage-id: outage-id}
+            (merge outage 
+                {
+                    acknowledged-at: stacks-block-height,
+                    status: "acknowledged"
+                })))
+    )
+)
+
+;; Resolve outage and calculate compensation
+(define-public (resolve-outage (consumer principal) (outage-id uint))
+    (let (
+        (outage (unwrap! (map-get? outage-reports {consumer: consumer, outage-id: outage-id}) err-outage-not-found))
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+        (sla (map-get? provider-slas tx-sender))
+        (outage-duration (- stacks-block-height (get reported-at outage)))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (is-eq tx-sender (get provider outage)) err-unauthorized)
+        (asserts! (is-eq (get status outage) "acknowledged") err-invalid-amount)
+        
+        ;; Mark outage as resolved
+        (map-set outage-reports {consumer: consumer, outage-id: outage-id}
+            (merge outage 
+                {
+                    resolved-at: stacks-block-height,
+                    status: "resolved"
+                }))
+        
+        ;; Calculate and process compensation
+        (unwrap-panic (calculate-and-pay-compensation consumer outage-id outage-duration sla))
+        
+        ;; Update provider statistics
+        (let (
+            (max-duration (match sla sla-terms (get max-outage-duration sla-terms) u72))
+            (sla-violated (> outage-duration max-duration))
+        )
+            (unwrap-panic (update-outage-statistics tx-sender outage-duration sla-violated)))
+        
+        (ok true)
+    )
+)
+
+;; Pay compensation to consumer
+(define-public (pay-compensation (consumer principal) (outage-id uint))
+    (let (
+        (compensation (unwrap! (map-get? compensation-records {consumer: consumer, outage-id: outage-id}) err-not-found))
+        (provider-info (unwrap! (map-get? utility-providers tx-sender) err-unauthorized))
+    )
+        (asserts! (get active provider-info) err-unauthorized)
+        (asserts! (is-eq (get payment-status compensation) "pending") err-compensation-already-paid)
+        (try! (stx-transfer? (get total-compensation compensation) tx-sender consumer))
+        (ok (map-set compensation-records {consumer: consumer, outage-id: outage-id}
+            (merge compensation 
+                {
+                    paid-at: stacks-block-height,
+                    payment-status: "paid"
+                })))
+    )
+)
+
+;; Private helper functions for outage system
+
+;; Calculate and process compensation
+(define-private (calculate-and-pay-compensation (consumer principal) (outage-id uint) (duration uint) (sla (optional {max-outage-duration: uint, compensation-rate: uint, response-time-guarantee: uint, uptime-percentage: uint, penalty-multiplier: uint})))
+    (match sla
+        sla-terms (let (
+            (base-comp (* duration (get compensation-rate sla-terms)))
+            (sla-penalty (if (> duration (get max-outage-duration sla-terms))
+                (* base-comp (/ (get penalty-multiplier sla-terms) u100))
+                u0))
+            (total-comp (+ base-comp sla-penalty))
+        )
+            (map-set compensation-records {consumer: consumer, outage-id: outage-id}
+                {
+                    base-compensation: base-comp,
+                    sla-penalty: sla-penalty,
+                    total-compensation: total-comp,
+                    paid-at: u0,
+                    payment-status: "pending"
+                })
+            (ok total-comp))
+        (ok u0))
+)
+
+;; Update provider outage statistics
+(define-private (update-outage-statistics (provider principal) (duration uint) (sla-violated bool))
+    (let (
+        (current-stats (default-to
+            {total-outages: u0, total-downtime: u0, average-resolution-time: u0, sla-violations: u0, total-compensation-paid: u0, last-outage-date: u0}
+            (map-get? outage-statistics provider)))
+        (new-total-outages (+ (get total-outages current-stats) u1))
+        (new-total-downtime (+ (get total-downtime current-stats) duration))
+        (new-avg-resolution (/ new-total-downtime new-total-outages))
+        (new-sla-violations (if sla-violated (+ (get sla-violations current-stats) u1) (get sla-violations current-stats)))
+    )
+        (ok (map-set outage-statistics provider
+            {
+                total-outages: new-total-outages,
+                total-downtime: new-total-downtime,
+                average-resolution-time: new-avg-resolution,
+                sla-violations: new-sla-violations,
+                total-compensation-paid: (get total-compensation-paid current-stats),
+                last-outage-date: stacks-block-height
+            }))
+    )
+)
+
+;; Read-only functions for outage system
+
+;; Get outage report details
+(define-read-only (get-outage-report (consumer principal) (outage-id uint))
+    (map-get? outage-reports {consumer: consumer, outage-id: outage-id})
+)
+
+;; Get provider SLA details
+(define-read-only (get-provider-sla (provider principal))
+    (map-get? provider-slas provider)
+)
+
+;; Get outage statistics for provider
+(define-read-only (get-outage-statistics (provider principal))
+    (map-get? outage-statistics provider)
+)
+
+;; Get compensation record details
+(define-read-only (get-compensation-record (consumer principal) (outage-id uint))
+    (map-get? compensation-records {consumer: consumer, outage-id: outage-id})
+)
+
+;; Check provider SLA compliance
+(define-read-only (check-sla-compliance (provider principal))
+    (match (map-get? outage-statistics provider)
+        stats (let (
+            (sla (map-get? provider-slas provider))
+        )
+            (match sla
+                sla-terms (let (
+                    (total-outages (get total-outages stats))
+                    (violation-rate (if (> total-outages u0)
+                        (/ (* (get sla-violations stats) u100) total-outages)
+                        u0))
+                    (compliance-rate (- u100 violation-rate))
+                )
+                    compliance-rate)
+                u100))
+        u100)
+)
+
+;; Calculate expected compensation for outage duration
+(define-read-only (calculate-expected-compensation (provider principal) (duration uint))
+    (match (map-get? provider-slas provider)
+        sla (let (
+            (base-comp (* duration (get compensation-rate sla)))
+            (penalty (if (> duration (get max-outage-duration sla))
+                (* base-comp (/ (get penalty-multiplier sla) u100))
+                u0))
+        )
+            (+ base-comp penalty))
+        u0)
+)
